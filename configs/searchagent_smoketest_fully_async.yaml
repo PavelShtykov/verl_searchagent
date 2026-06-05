@@ -98,7 +98,7 @@ actor_rollout_ref:
     kl_loss_coef: 0.001
     kl_loss_type: low_var_kl
     entropy_coeff: 0.0
-    ppo_max_token_len_per_gpu: 8192
+    ppo_max_token_len_per_gpu: 2048
     # Train on rollout log probs (decoupled rollout vs. training engines).
     use_rollout_log_probs: True
     megatron:
@@ -109,9 +109,9 @@ actor_rollout_ref:
       pipeline_model_parallel_size: 1
       context_parallel_size: 1
       sequence_parallel: true
-      param_offload: false
-      optimizer_offload: false
-      grad_offload: false
+      param_offload: true
+      optimizer_offload: true
+      grad_offload: true
       override_transformer_config:
         apply_rope_fusion: false
         masked_softmax_fusion: true
@@ -119,10 +119,15 @@ actor_rollout_ref:
         bias_dropout_fusion: true
         gradient_accumulation_fusion: true
         persist_layer_norm: true
+        # Activation recomputation (gradient checkpointing): the biggest single lever against
+        # training-time activation OOM, at the cost of recomputing activations in the backward pass.
+        recompute_granularity: full
+        recompute_method: uniform
+        recompute_num_layers: 1
 
   ref:
     log_prob_micro_batch_size_per_gpu: 4
-    log_prob_max_token_len_per_gpu: 8192
+    log_prob_max_token_len_per_gpu: 2048
     log_prob_use_dynamic_bsz: True
     megatron:
       # Ref shares the single trainer GPU -> TP=1 (the colocated sync smoke used TP=2).
@@ -130,7 +135,7 @@ actor_rollout_ref:
       pipeline_model_parallel_size: 1
       context_parallel_size: 1
       sequence_parallel: true
-      param_offload: false
+      param_offload: true
 
   rollout:
     name: vllm

@@ -423,7 +423,13 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             pad.non_tensor_batch[OUTPUT_INDEX_KEY] = np.zeros(pad_size, dtype=np.int32)
 
         logger.info("Padded actor batch %d -> %d rows (mini_batch_size=%d)", size, size + pad_size, mini_batch_size)
-        return DataProto.concat([batch, pad])
+        # ``select_idxs`` carries ``batch.meta_info``; clear it so ``DataProto.concat`` does not
+        # assert equality on array-valued meta_info entries (e.g. ``global_token_num``).
+        pad.meta_info = {}
+        padded = DataProto.concat([batch, pad])
+        if "global_token_num" in padded.meta_info and "attention_mask" in padded.batch.keys():
+            padded.meta_info["global_token_num"] = padded.batch["attention_mask"].sum(dim=-1).tolist()
+        return padded
 
     def _create_actor_rollout_classes(self):
         # create actor — always use Role.Actor (not ActorRollout) even when
