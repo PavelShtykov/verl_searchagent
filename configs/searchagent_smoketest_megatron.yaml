@@ -1,0 +1,191 @@
+# SearchAgent smoke config (Megatron): Qwen3.5-2B on 2x H100, local.
+# Megatron twin of the FSDP smoke — same model/data/steps, actor+ref on Megatron-core
+# to exercise the same path as the 4-node 35B job before the cluster job schedules.
+#
+# Launch:
+#   python -m verl.trainer.main_ppo_sync \
+#       --config-path=/abs/path/to/this/dir \
+#       --config-name=searchagent_smoketest_megatron
+hydra:
+  searchpath:
+    - file:///qwarium/home/p.shtykov/biglm/turbo-verl/verl/verl/trainer/config
+
+defaults:
+  - ppo_megatron_trainer
+  - _self_
+
+# ====================================================================
+# Algorithm: GRPO is REQUIRED for multi-trajectory advantage broadcast.
+# ====================================================================
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: False
+  norm_adv_by_std_in_grpo: True
+  gamma: 1.0
+  lam: 1.0
+
+# ====================================================================
+# Reward: rule-based via custom_reward_function. Reward model disabled.
+# ====================================================================
+reward:
+  reward_model:
+    enable: False
+    enable_resource_pool: False
+    reward_manager: naive
+  custom_reward_function:
+    path: /qwarium/home/p.shtykov/biglm/turbo-verl/reward_scores/search_agent_reward.py
+    name: compute_score
+
+# ====================================================================
+# Model + Actor + Rollout + Ref
+# ====================================================================
+actor_rollout_ref:
+
+  model:
+    path: Qwen/Qwen3.5-2B
+    # path: Qwen/Qwen3-4B-Instruct-2507
+    use_fused_kernels: false
+
+  actor:
+    optim:
+      lr: 1e-6
+    # Tiny batches for smoke: 4 prompts x n=4 sessions = 16 rollouts per step
+    ppo_mini_batch_size: 4
+    ppo_micro_batch_size_per_gpu: 1
+    use_kl_loss: True
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+    entropy_coeff: 0.0
+    ppo_max_token_len_per_gpu: 8192
+    megatron:
+      # HF -> Megatron-core on load
+      use_mbridge: true
+      vanilla_mbridge: false
+      # TP=2 across the 2 local GPUs (PP=CP=1 -> DP=1). Exercises the TP path used by the 35B job.
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      context_parallel_size: 1
+      sequence_parallel: true
+      # Small model fits on H100 — no offload (faster smoke).
+      param_offload: false
+      optimizer_offload: false
+      grad_offload: false
+      override_transformer_config:
+        apply_rope_fusion: false          # 3D mrope + rope fusion don't mix
+        masked_softmax_fusion: true
+        bias_activation_fusion: true
+        bias_dropout_fusion: true
+        gradient_accumulation_fusion: true
+        persist_layer_norm: true
+
+  ref:
+    log_prob_micro_batch_size_per_gpu: 4
+    log_prob_max_token_len_per_gpu: 8192
+    megatron:
+      tensor_model_parallel_size: 2
+      pipeline_model_parallel_size: 1
+      context_parallel_size: 1
+      sequence_parallel: true
+      param_offload: false
+
+  rollout:
+    name: vllm
+    # Required for AgentLoop — sync mode uses a different code path.
+    mode: async
+    # GRPO group size: 4 trajectories per prompt
+    n: 4
+    gpu_memory_utilization: 0.35
+    tensor_model_parallel_size: 1
+    prompt_length: 2048
+    # Per-round budget. After ContextManager compression response_mask resets
+    # to summary length, so response_length is effectively the per-round budget.
+    response_length: 4096
+    log_prob_micro_batch_size_per_gpu: 4
+    log_prob_max_token_len_per_gpu: 4096
+    calculate_log_probs: True
+    max_model_len: 8192
+
+    temperature: 1.0
+    top_p: 0.9
+    top_k: -1
+
+    multi_turn:
+      enable: True
+      # Verified for Qwen3.5 family
+      format: qwen3_coder
+      tool_config_path: /qwarium/home/p.shtykov/biglm/alignment-configs/configs/RL/DEBUG/AINLP-12137-searchagent-harness-verl/searchagent_tools_config_smoke.yaml
+      # CRITICAL for Qwen3 series: strip <think> blocks before passing past
+      # turns back to the model, else reasoning accumulates and fills the budget.
+      use_inference_chat_template: True
+      tokenization_sanity_check_mode: ignore_strippable
+      max_assistant_turns: 20
+      max_user_turns: 20
+      max_parallel_calls: 1
+      max_tool_response_length: 2048
+      tool_response_truncate_side: middle
+
+    agent:
+      default_agent_loop: search_agent
+      num_workers: 2
+
+    val_kwargs:
+      top_p: 1.0
+      top_k: -1
+      temperature: 0.0
+      n: 1
+
+    engine_kwargs:
+      vllm:
+        compilation_config:
+          cudagraph_mode: PIECEWISE
+
+# ====================================================================
+# Trainer
+# ====================================================================
+trainer:
+  project_name: searchagent_smoketest
+  experiment_name: qwen35_2b_2gpu_megatron
+  logger: ["console"]
+  log_val_generations: 5
+  rollout_data_dir: dumps/rollouts
+  validation_data_dir: dumps/val
+  n_gpus_per_node: 2
+  nnodes: 1
+  save_freq: -1
+  test_freq: -1
+  total_epochs: 5
+  total_training_steps: 2
+  val_before_train: True
+  val_only: False
+  critic_warmup: 0
+  device: cuda
+  default_local_dir: checkpoints/searchagent_smoke_megatron
+
+# ====================================================================
+# Data
+# ====================================================================
+data:
+  train_files: data/smoke_train.parquet
+  val_files: data/smoke_val.parquet
+  # Required for AgentLoop: rollout receives raw messages, not a pre-rendered prompt
+  return_raw_chat: True
+  return_multi_modal_inputs: False
+  prompt_key: prompt
+  max_prompt_length: 2048
+  truncation: error
+  filter_overlong_prompts: True
+  train_batch_size: 4
+  val_batch_size: 4
+  dataloader_num_workers: 0
+  tool_config_path: /qwarium/home/p.shtykov/biglm/alignment-configs/configs/RL/DEBUG/AINLP-12137-searchagent-harness-verl/searchagent_tools_config_smoke.yaml
+
+# ====================================================================
+# TransferQueue (required for multi-trajectory output). Single node -> 1 unit.
+# ====================================================================
+transfer_queue:
+  enable: True
+  backend:
+    storage_backend: SimpleStorage
+    SimpleStorage:
+      total_storage_size: 10000
+      num_data_storage_units: 1
