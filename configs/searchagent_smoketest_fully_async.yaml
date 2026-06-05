@@ -11,13 +11,13 @@
 #       --config-name=searchagent_smoketest_fully_async
 hydra:
   searchpath:
-    # Both dirs must point at your checkout: the fully async base config lives in the first,
-    # and it in turn pulls ppo_megatron_trainer from the second.
-    - file:///qwarium/home/p.shtykov/biglm/turbo-verl/verl/verl/experimental/fully_async_policy/config
     - file:///qwarium/home/p.shtykov/biglm/turbo-verl/verl/verl/trainer/config
 
+# Inherit the base megatron trainer directly (not fully_async_ppo_megatron_trainer): that config
+# carries its own hydra.searchpath, which hydra forbids when pulled in as a non-primary default.
+# Everything fully_async_ppo_megatron_trainer adds on top of ppo_megatron_trainer is inlined below.
 defaults:
-  - fully_async_ppo_megatron_trainer
+  - ppo_megatron_trainer
   - _self_
 
 # ====================================================================
@@ -45,7 +45,6 @@ rollout:
 
 # ====================================================================
 # Algorithm: GRPO required for multi-trajectory advantage broadcast.
-# rollout_correction.bypass_mode=True is inherited from the fully async base.
 # ====================================================================
 algorithm:
   adv_estimator: grpo
@@ -53,6 +52,9 @@ algorithm:
   norm_adv_by_std_in_grpo: True
   gamma: 1.0
   lam: 1.0
+  # Inlined from the fully async base: keep rollout log probs as-is for decoupled rollout/training.
+  rollout_correction:
+    bypass_mode: True
 
 # ====================================================================
 # Reward: rule-based via custom_reward_function (streamed by RewardLoopManager).
