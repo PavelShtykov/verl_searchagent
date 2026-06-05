@@ -120,9 +120,15 @@ class AgentLoopWithContextManagement(AgentLoopBase, ABC):
             if not extra_fields:
                 extra_fields.update(output.extra_fields)
             else:
-                max_global_steps = output.extra_fields.get("max_global_steps")
-                if max_global_steps:
-                    extra_fields["max_global_steps"] = max_global_steps
+                # Keep the rollout weight-version markers fresh across turns. ``min_global_steps`` is
+                # seeded on first sight (earliest version) and ``max_global_steps`` tracks the latest;
+                # both are required by fully async batch assembly when the loop preseeds extra_fields.
+                for weight_version_key in ("global_steps", "max_global_steps"):
+                    value = output.extra_fields.get(weight_version_key)
+                    if value is not None:
+                        extra_fields[weight_version_key] = value
+                if extra_fields.get("min_global_steps") is None:
+                    extra_fields["min_global_steps"] = output.extra_fields.get("min_global_steps")
         else:
             extra_fields = dict(output.extra_fields)
 

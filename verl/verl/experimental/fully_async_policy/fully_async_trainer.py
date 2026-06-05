@@ -19,6 +19,7 @@ import time
 from datetime import datetime
 from typing import Any
 
+import numpy as np
 import ray
 from omegaconf import OmegaConf, open_dict
 from tqdm import tqdm
@@ -30,10 +31,14 @@ from verl.experimental.fully_async_policy.detach_utils import (
     assemble_batch_from_rollout_samples,
 )
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
+from verl.experimental.fully_async_policy.multi_trajectory import (
+    compute_multi_trajectory_advantage,
+    has_multi_trajectory_outputs,
+)
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.trainer.ppo import core_algos
-from verl.trainer.ppo.ray_trainer import ResourcePoolManager
+from verl.trainer.ppo.ray_trainer import ResourcePoolManager, apply_kl_penalty
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
@@ -330,6 +335,57 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         batch.meta_info["fully_async/total_wait_time"] = total_wait_time
         return 0, batch
+
+    def _fit_compute_advantage(self, batch: DataProto) -> DataProto:
+        """Driver-side advantage computation.
+
+        Mirrors :meth:`SeparateRayPPOTrainer._fit_compute_advantage` but, for rollouts that emit
+        multiple segments per trajectory (context-managed agent loops), computes GRPO advantages
+        on the final segment of each trajectory and broadcasts them to the remaining segments.
+        Single-output rollouts fall back to the parent implementation.
+        """
+        if not has_multi_trajectory_outputs(batch):
+            return super()._fit_compute_advantage(batch)
+
+        metrics = self.metrics
+        timing_raw = self.timing_raw
+
+        with marked_timer("adv", timing_raw, color="brown"):
+            batch.batch["token_level_scores"] = self.reward_tensor
+
+            if self.reward_extra_infos_dict:
+                batch.non_tensor_batch.update({k: np.array(v) for k, v in self.reward_extra_infos_dict.items()})
+
+            if self.config.algorithm.use_kl_in_reward:
+                batch, kl_metrics = apply_kl_penalty(
+                    batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+                )
+                metrics.update(kl_metrics)
+            else:
+                batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+            rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+            bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+            if (
+                rollout_corr_config is not None
+                and "rollout_log_probs" in batch.batch
+                and not bypass_recomputing_logprobs
+            ):
+                from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+
+                batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
+                metrics.update(is_metrics)
+
+            batch = compute_multi_trajectory_advantage(
+                batch,
+                adv_estimator=self.config.algorithm.adv_estimator,
+                gamma=self.config.algorithm.gamma,
+                lam=self.config.algorithm.lam,
+                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
+                config=self.config.algorithm,
+            )
+        return batch
 
     def _create_actor_rollout_classes(self):
         # create actor — always use Role.Actor (not ActorRollout) even when

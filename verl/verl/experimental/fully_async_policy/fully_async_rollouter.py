@@ -30,6 +30,7 @@ from verl.experimental.fully_async_policy.detach_utils import (
     prepare_single_generation_data,
     safe_create_task,
 )
+from verl.experimental.fully_async_policy.fully_async_agent_loop import FullyAsyncAgentLoopWorker
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.protocol import DataProto
@@ -367,6 +368,12 @@ class FullyAsyncLLMServerManager(LLMServerManager):
 
 
 class FullyAsyncAgentLoopManager(AgentLoopManager):
+    def __init__(self, *args, **kwargs):
+        # Use the multi-output worker so context-managed agent loops that return
+        # list[AgentLoopOutput] are fanned out into per-segment rows.
+        self.agent_loop_workers_class = ray.remote(FullyAsyncAgentLoopWorker)
+        super().__init__(*args, **kwargs)
+
     async def generate_sequences_single(self, prompts: DataProto) -> DataProto:
         """Split input batch and dispatch to agent loop workers.
 
