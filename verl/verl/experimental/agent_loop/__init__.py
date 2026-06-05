@@ -19,15 +19,40 @@ from .agent_loop import (
     AgentLoopWorker,
     get_trajectory_info,
 )
+from .agent_loop_with_context_management import (
+    AgentLoopWithContextManagement,
+    SummarizerAgentLoop,
+    ToolSlidingWindowAgentLoop,
+)
+from .context_manager import (
+    ContextManager,
+    ContextState,
+    SlidingWindowContextManager,
+    SummarizerContextManager,
+)
 from .single_turn_agent_loop import SingleTurnAgentLoop
 from .tool_agent_loop import ToolAgentLoop
 
-_ = [SingleTurnAgentLoop, ToolAgentLoop]
+_ = [
+    SingleTurnAgentLoop,
+    ToolAgentLoop,
+    SummarizerAgentLoop,
+    ToolSlidingWindowAgentLoop,
+]
 
 __all__ = [
     "AgentLoopBase",
     "AgentLoopManager",
-    "AgentLoopWorker",
     "AgentLoopOutput",
+    "AgentLoopWorker",
     "get_trajectory_info",
+    "AgentLoopWithContextManagement",
+    "ContextManager",
+    "ContextState",
+    "SlidingWindowContextManager",
+    "SummarizerContextManager",
+    "SummarizerAgentLoop",
+    "ToolSlidingWindowAgentLoop",
+    "SingleTurnAgentLoop",
+    "ToolAgentLoop",
 ]
