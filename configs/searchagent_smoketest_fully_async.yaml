@@ -73,6 +73,9 @@ reward:
 # ====================================================================
 actor_rollout_ref:
 
+  # Fully async is disaggregated: actor lives on the trainer pool, rollout on its own pool.
+  hybrid_engine: False
+
   model:
     path: Qwen/Qwen3.5-2B
     use_fused_kernels: false
