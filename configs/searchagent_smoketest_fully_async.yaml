@@ -33,13 +33,13 @@ async_training:
   use_trainer_do_validate: False
 
 # ====================================================================
-# Rollout resource pool (separate from the trainer pool)
+# Rollout resource pool + scheduling (this top-level `rollout` block is fully-async-specific
+# and only sizes the rollout GPU pool / streaming budget; the vLLM engine config and the
+# canonical GRPO `n` live under actor_rollout_ref.rollout below).
 # ====================================================================
 rollout:
   nnodes: 1
   n_gpus_per_node: 1
-  # GRPO group size: 4 trajectories per prompt.
-  n: 4
   # Total prompts the rollouter streams before sending the termination signal (smoke length).
   total_rollout_steps: 16
 
@@ -124,7 +124,9 @@ actor_rollout_ref:
     # AgentLoop requires async server mode.
     mode: async
     n: 4
-    gpu_memory_utilization: 0.5
+    # Rollouter owns its GPU (disaggregated, hybrid_engine=False); leave ~20% headroom for the
+    # NCCL weight transfer staged during parameter sync.
+    gpu_memory_utilization: 0.8
     tensor_model_parallel_size: 1
     prompt_length: 2048
     response_length: 4096
