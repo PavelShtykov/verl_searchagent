@@ -21,6 +21,7 @@ from typing import Any
 
 import numpy as np
 import ray
+import torch
 from omegaconf import OmegaConf, open_dict
 from tqdm import tqdm
 
@@ -32,6 +33,8 @@ from verl.experimental.fully_async_policy.detach_utils import (
 )
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
 from verl.experimental.fully_async_policy.multi_trajectory import (
+    OUTPUT_INDEX_KEY,
+    SESSION_ID_KEY,
     compute_multi_trajectory_advantage,
     has_multi_trajectory_outputs,
 )
@@ -385,7 +388,42 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
                 config=self.config.algorithm,
             )
+
+        # Multi-output rollouts give a variable row count that may not divide the actor mini-batch
+        # size; pad with masked no-op rows now that advantages are fixed on the real rows.
+        batch = self._pad_to_actor_mini_batch_size(batch)
         return batch
+
+    def _pad_to_actor_mini_batch_size(self, batch: DataProto) -> DataProto:
+        """Append masked no-op rows so the batch size is divisible by the actor mini-batch size.
+
+        Padding rows clone real rows (so every tensor/shape stays valid) but zero the loss-bearing
+        fields (response/loss mask, advantages, returns, scores), so they contribute no gradient and
+        no reward. Advantages were already computed on the real rows, so trajectory grouping is
+        unaffected. ``pad_size`` is always smaller than one mini-batch, so no mini-batch is all-padding.
+        """
+        mini_batch_size = (
+            self.config.actor_rollout_ref.actor.ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        )
+        size = len(batch)
+        remainder = size % mini_batch_size
+        if remainder == 0:
+            return batch
+
+        pad_size = mini_batch_size - remainder
+        pad = batch.select_idxs([i % size for i in range(pad_size)])
+        for key in ("response_mask", "loss_mask", "advantages", "returns", "token_level_scores", "token_level_rewards"):
+            if key in pad.batch.keys():
+                pad.batch[key] = torch.zeros_like(pad.batch[key])
+        if "uid" in pad.non_tensor_batch:
+            pad.non_tensor_batch["uid"] = np.array(["__pad__"] * pad_size, dtype=object)
+        if SESSION_ID_KEY in pad.non_tensor_batch:
+            pad.non_tensor_batch[SESSION_ID_KEY] = np.arange(pad_size, dtype=np.int32)
+        if OUTPUT_INDEX_KEY in pad.non_tensor_batch:
+            pad.non_tensor_batch[OUTPUT_INDEX_KEY] = np.zeros(pad_size, dtype=np.int32)
+
+        logger.info("Padded actor batch %d -> %d rows (mini_batch_size=%d)", size, size + pad_size, mini_batch_size)
+        return DataProto.concat([batch, pad])
 
     def _create_actor_rollout_classes(self):
         # create actor — always use Role.Actor (not ActorRollout) even when

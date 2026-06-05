@@ -85,8 +85,15 @@ actor_rollout_ref:
   actor:
     optim:
       lr: 1e-6
+      # Fully async does not auto-derive optim.total_training_steps (no epoch dataloader), so the
+      # megatron LR scheduler would see lr_decay_steps=0 and assert. Set it explicitly; the value
+      # only sets the decay horizon (kept large so LR stays ~flat over this short smoke).
+      lr_decay_steps: 100
     ppo_mini_batch_size: 4
     ppo_micro_batch_size_per_gpu: 1
+    # Dynamic (token-budget) micro-batching. Required here: multi-output agent loops emit a
+    # variable number of rows per prompt, which is not divisible by a fixed micro_batch_size.
+    use_dynamic_bsz: True
     use_kl_loss: True
     kl_loss_coef: 0.001
     kl_loss_type: low_var_kl
@@ -116,6 +123,7 @@ actor_rollout_ref:
   ref:
     log_prob_micro_batch_size_per_gpu: 4
     log_prob_max_token_len_per_gpu: 8192
+    log_prob_use_dynamic_bsz: True
     megatron:
       # Ref shares the single trainer GPU -> TP=1 (the colocated sync smoke used TP=2).
       tensor_model_parallel_size: 1
@@ -137,6 +145,7 @@ actor_rollout_ref:
     response_length: 4096
     log_prob_micro_batch_size_per_gpu: 4
     log_prob_max_token_len_per_gpu: 4096
+    log_prob_use_dynamic_bsz: True
     # Required by fully async: training consumes rollout log probs.
     calculate_log_probs: True
     max_model_len: 8192
@@ -213,7 +222,9 @@ data:
   filter_overlong_prompts: True
   # Fully async streams one prompt at a time.
   gen_batch_size: 1
-  train_batch_size: 4
+  # Required to be 0 in fully async: the train batch is sized by required_samples
+  # (ppo_mini_batch_size * async_training.require_batches), not by train_batch_size.
+  train_batch_size: 0
   val_batch_size: 4
   dataloader_num_workers: 0
   tool_config_path: /qwarium/home/p.shtykov/biglm/alignment-configs/configs/RL/DEBUG/AINLP-12137-searchagent-harness-verl/searchagent_tools_config_smoke.yaml
