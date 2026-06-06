@@ -389,18 +389,23 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 config=self.config.algorithm,
             )
 
-        # Multi-output rollouts give a variable row count that may not divide the actor mini-batch
-        # size; pad with masked no-op rows now that advantages are fixed on the real rows.
-        batch = self._pad_to_actor_mini_batch_size(batch)
+        return batch
+
+    def _fit_update_actor(self, batch: DataProto) -> DataProto:
+        # Pad only for the actor update (its mini-batch iterator requires a divisible row count);
+        # downstream dump/metrics keep operating on the real, unpadded batch.
+        super()._fit_update_actor(self._pad_to_actor_mini_batch_size(batch))
         return batch
 
     def _pad_to_actor_mini_batch_size(self, batch: DataProto) -> DataProto:
-        """Append masked no-op rows so the batch size is divisible by the actor mini-batch size.
+        """Append cheap masked no-op rows so the batch size divides the actor mini-batch size.
 
-        Padding rows clone real rows (so every tensor/shape stays valid) but zero the loss-bearing
-        fields (response/loss mask, advantages, returns, scores), so they contribute no gradient and
-        no reward. Advantages were already computed on the real rows, so trajectory grouping is
-        unaffected. ``pad_size`` is always smaller than one mini-batch, so no mini-batch is all-padding.
+        Multi-output rollouts emit a variable row count that need not divide
+        ``ppo_mini_batch_size * rollout.n``. Padding rows clone the first row (keeping every tensor
+        shape/dtype valid) but reduce attention to a single token and zero the loss-bearing fields
+        (response/loss mask, advantages, returns, scores), so they add no gradient, no reward and
+        negligible compute. ``pad_size`` is always smaller than one mini-batch, so no mini-batch is
+        entirely padding.
         """
         mini_batch_size = (
             self.config.actor_rollout_ref.actor.ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
@@ -411,7 +416,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             return batch
 
         pad_size = mini_batch_size - remainder
-        pad = batch.select_idxs([i % size for i in range(pad_size)])
+        pad = batch.select_idxs([0] * pad_size)
+        if "attention_mask" in pad.batch.keys():
+            attention_mask = torch.zeros_like(pad.batch["attention_mask"])
+            attention_mask[:, 0] = 1  # keep one valid token so the packed forward stays well-formed
+            pad.batch["attention_mask"] = attention_mask
         for key in ("response_mask", "loss_mask", "advantages", "returns", "token_level_scores", "token_level_rewards"):
             if key in pad.batch.keys():
                 pad.batch[key] = torch.zeros_like(pad.batch[key])

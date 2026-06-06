@@ -31,9 +31,24 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorker):
     """Agent loop worker that fans out ``list[AgentLoopOutput]`` into per-segment rows."""
 
     async def _agent_loop_postprocess(self, output, validate, **kwargs):
-        """Pad and post-process every segment of a (possibly multi-output) agent loop run."""
+        """Pad and post-process every segment of a (possibly multi-output) agent loop run.
+
+        The episode reward only attaches to the final segment (the one that finalizes); copy it onto
+        the earlier segments so per-row reward metrics reflect the trajectory reward instead of being
+        diluted by the intermediate segments' zeros. Advantage uses the final segment only, so this
+        does not change training.
+        """
         outputs = output if isinstance(output, list) else [output]
-        return [await super()._agent_loop_postprocess(segment, validate, **kwargs) for segment in outputs]
+        results = [await super()._agent_loop_postprocess(segment, validate, **kwargs) for segment in outputs]
+
+        final = results[-1]
+        if final.reward_score is not None:
+            reward_extra_info = final.extra_fields.get("reward_extra_info")
+            for segment in results[:-1]:
+                segment.reward_score = final.reward_score
+                if reward_extra_info is not None:
+                    segment.extra_fields["reward_extra_info"] = reward_extra_info
+        return results
 
     def _postprocess(self, inputs, input_non_tensor_batch=None, validate=False):
         # ``inputs`` is one (possibly empty) list of padded segments per input sample.
