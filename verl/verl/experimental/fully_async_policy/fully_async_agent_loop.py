@@ -33,13 +33,23 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorker):
     async def _agent_loop_postprocess(self, output, validate, **kwargs):
         """Pad and post-process every segment of a (possibly multi-output) agent loop run.
 
-        The episode reward only attaches to the final segment (the one that finalizes); copy it onto
-        the earlier segments so per-row reward metrics reflect the trajectory reward instead of being
-        diluted by the intermediate segments' zeros. Advantage uses the final segment only, so this
-        does not change training.
+        During validation only the final segment is kept: validation scores the final answer, and
+        emitting a single row per input keeps the standard validation aggregation well-defined (it
+        unions the generated batch back onto the prompt batch, which requires one output row per
+        prompt). This matches the session-aware validation of the synchronous trainer.
+
+        For training, the episode reward only attaches to the final segment (the one that finalizes);
+        copy it onto the earlier segments so per-row reward metrics reflect the trajectory reward
+        instead of being diluted by the intermediate segments' zeros. Advantage uses the final
+        segment only, so this does not change training.
         """
         outputs = output if isinstance(output, list) else [output]
+        if validate:
+            outputs = outputs[-1:]
+
         results = [await super()._agent_loop_postprocess(segment, validate, **kwargs) for segment in outputs]
+        if not results:
+            return results
 
         final = results[-1]
         if final.reward_score is not None:
