@@ -1,0 +1,233 @@
+# ============================================================================
+# SearchAgent fully-async smoke (Megatron): Qwen3.6-35B-A3B GRPO on 4 nodes (4x8 H100).
+#
+# Fully-async twin of searchagent_megatron_35b.yaml. The rollouter and trainer run on
+# DISAGGREGATED GPU pools: here trainer = 2 nodes (16 GPU) and rollout = 2 nodes (16 GPU),
+# 4 nodes total. Same model / parallelism / MoE / offload settings as the sync 35B config;
+# only the fully-async scheduling, resource split and decoupled-logprob flags are added, and
+# the transfer_queue block (sync-only) is removed.
+#
+# Launch (entrypoint differs from sync — it is fully_async_main, not main_ppo_sync):
+#   python -m verl.experimental.fully_async_policy.fully_async_main \
+#       --config-path=/app/configs/fast_templates \
+#       --config-name=searchagent_megatron_35b_fully_async
+# ============================================================================
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_megatron_trainer
+  - _self_
+
+# ---- Fully-async scheduling (top-level block, required by fully_async_main) ----
+async_training:
+  staleness_threshold: 0.1
+  trigger_parameter_sync_step: 1
+  require_batches: 1
+  partial_rollout: True
+  use_trainer_do_validate: False
+
+# ---- Rollout resource pool + streaming budget (disaggregated from the trainer pool).
+#      2 nodes x 8 = 16 rollout GPUs -> 2 vLLM replicas (TP=8 each). ----
+rollout:
+  nnodes: 2
+  n_gpus_per_node: 8
+  # Prompts streamed before the termination signal. required_samples = ppo_mini_batch_size *
+  # require_batches = 16, so 32 -> ~2 training steps (smoke length).
+  total_rollout_steps: 32
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: False
+  kl_ctrl:
+    kl_coef: 0.0
+  # Inlined from the fully-async base: keep rollout log probs as-is for decoupled rollout/training.
+  rollout_correction:
+    bypass_mode: True
+
+reward:
+  reward_manager:
+    name: naive
+  reward_model:
+    enable: False
+  custom_reward_function:
+    path: /app/reward_scores/search_agent_reward.py
+    name: compute_score
+
+actor_rollout_ref:
+  # Fully async is disaggregated: actor on the trainer pool, rollout on its own pool.
+  hybrid_engine: False
+  nccl_timeout: 7200
+
+  model:
+    path: /from_s3/model/hf/Qwen3.6-35B-A3B
+    use_shm: true
+    use_fused_kernels: false
+    # thd / remove padding is required by the fully-async training path.
+    use_remove_padding: True
+
+  actor:
+    # Train on rollout log probs (decoupled rollout vs. training engines).
+    use_rollout_log_probs: True
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    clip_ratio_c: 10.0
+    ppo_micro_batch_size_per_gpu: 1
+    use_dynamic_bsz: true
+    ppo_max_token_len_per_gpu: 16384
+    ppo_mini_batch_size: 16
+    entropy_coeff: 0
+    loss_agg_mode: token-mean
+    optim:
+      lr: 1.0e-06
+      lr_warmup_steps: -1
+      # Fully async does not auto-derive optim.total_training_steps (no epoch dataloader), so the
+      # megatron LR scheduler would assert lr_decay_steps > 0. Set it explicitly.
+      lr_decay_steps: 100
+      weight_decay: 0.1
+      override_optimizer_config:
+        optimizer_offload_fraction: 1.0
+        overlap_cpu_optimizer_d2h_h2d: true
+        use_precision_aware_optimizer: true
+        optimizer_cpu_offload: true
+      clip_grad: 1.0
+    megatron:
+      vanilla_mbridge: false
+      use_mbridge: true
+      param_offload: true
+      optimizer_offload: true
+      grad_offload: true
+      pipeline_model_parallel_size: 1
+      tensor_model_parallel_size: 8
+      expert_model_parallel_size: 8
+      expert_tensor_parallel_size: 1
+      context_parallel_size: 1
+      sequence_parallel: true
+      override_transformer_config:
+        apply_rope_fusion: false
+        masked_softmax_fusion: true
+        bias_activation_fusion: true
+        bias_dropout_fusion: true
+        gradient_accumulation_fusion: true
+        deallocate_pipeline_outputs: true
+        persist_layer_norm: true
+        moe_grouped_gemm: true
+        moe_permute_fusion: true
+        moe_token_dispatcher_type: flex
+        moe_router_dtype: fp32
+        moe_enable_deepep: true
+        account_for_loss_in_pipeline_split: true
+        account_for_embedding_in_pipeline_split: true
+
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+    log_prob_use_dynamic_bsz: true
+    log_prob_max_token_len_per_gpu: 16384
+    megatron:
+      pipeline_model_parallel_size: 1
+      tensor_model_parallel_size: 8
+      expert_model_parallel_size: 8
+      expert_tensor_parallel_size: 1
+      context_parallel_size: 1
+      sequence_parallel: true
+      param_offload: true
+
+  rollout:
+    name: vllm
+    mode: async  # required for AgentLoop
+    n: 8
+    # Required by fully async: training consumes rollout log probs.
+    calculate_log_probs: True
+    engine_kwargs:
+      vllm:
+        moe_backend: triton
+        # PIECEWISE cudagraphs: works around the Gated-DeltaNet full-graph capture
+        compilation_config:
+          cudagraph_mode: PIECEWISE
+    free_cache_engine: true
+    enable_chunked_prefill: true
+    enforce_eager: false
+    gpu_memory_utilization: 0.55
+    tensor_model_parallel_size: 8
+    pipeline_model_parallel_size: 1
+    expert_parallel_size: 1
+    prompt_length: 4096
+    response_length: 12288
+    max_num_batched_tokens: 16384
+    max_model_len: 16384
+    checkpoint_engine:
+      # NCCL weight transfer trainer -> rollout replicas (fully async).
+      backend: "nccl"
+      update_weights_bucket_megabytes: 2048
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    log_prob_micro_batch_size_per_gpu: 1
+    log_prob_use_dynamic_bsz: true
+    log_prob_max_token_len_per_gpu: 4096
+    val_kwargs:
+      # Sample (not greedy) in validation so the cold model can actually emit finalize_ranking.
+      temperature: 1.0
+      top_p: 0.7
+      top_k: -1
+      do_sample: true
+      n: 1
+    multi_turn:
+      enable: True
+      format: qwen3_coder
+      tool_config_path: /app/configs/fast_templates/searchagent_tools_config_smoke.yaml
+      use_inference_chat_template: True
+      tokenization_sanity_check_mode: ignore_strippable
+      max_assistant_turns: 20
+      max_user_turns: 20
+      max_parallel_calls: 1
+      max_tool_response_length: 2048
+      tool_response_truncate_side: middle
+    agent:
+      # Routes to @register("search_agent") in SearchAgentLoop
+      default_agent_loop: search_agent
+      num_workers: 32
+
+# ---- Trainer resource pool. 2 nodes x 8 = 16 training GPUs (TP=8 -> data parallel = 2). ----
+trainer:
+  logger: ["console", "clearml"]
+  project_name: searchagent_megatron_35b_fully_async
+  experiment_name: searchagent-35b-4node-fully-async
+  nnodes: 2
+  n_gpus_per_node: 8
+  # Validation through the rollouter (use_trainer_do_validate=False); sampling val_kwargs above.
+  val_before_train: True
+  val_only: false
+  test_freq: -1
+  save_freq: -1
+  total_epochs: 100
+  total_training_steps: 2  # smoke
+  resume_mode: disable
+  log_val_generations: 10
+  rollout_data_dir: dumps/rollouts_fully_async
+  validation_data_dir: dumps/val_fully_async
+  device: cuda
+  default_local_dir: checkpoints/searchagent_megatron_35b_fully_async
+
+data:
+  train_files: /app/data/smoke_train.parquet
+  val_files: /app/data/smoke_val.parquet
+  prompt_key: prompt
+  truncation: error
+  filter_overlong_prompts: True
+  max_prompt_length: 4096
+  max_response_length: 12288
+  dataloader_num_workers: 0
+  # Required for AgentLoop — rollout receives raw messages.
+  return_raw_chat: True
+  return_multi_modal_inputs: False
+  # Fully async streams one prompt at a time; train_batch_size must be 0 (batch sized by
+  # required_samples = ppo_mini_batch_size * require_batches).
+  gen_batch_size: 1
+  train_batch_size: 0
+  val_batch_size: 32
+  tool_config_path: /app/configs/fast_templates/searchagent_tools_config_smoke.yaml
