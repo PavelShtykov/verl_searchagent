@@ -2,8 +2,9 @@
 # SearchAgent fully-async smoke (Megatron): Qwen3.6-35B-A3B GRPO on 4 nodes (4x8 H100).
 #
 # Fully-async twin of searchagent_megatron_35b.yaml. The rollouter and trainer run on
-# DISAGGREGATED GPU pools: here trainer = 2 nodes (16 GPU) and rollout = 2 nodes (16 GPU),
-# 4 nodes total. Same model / parallelism / MoE / offload settings as the sync 35B config;
+# DISAGGREGATED GPU pools: here trainer = 1 node (8 GPU, data parallel = 1) and rollout = 3 nodes
+# (24 GPU, 3 replicas), 4 nodes total. dp=1 avoids the multi-output dp-divisibility walls (see the
+# trainer block). Same model / parallelism / MoE / offload settings as the sync 35B config;
 # only the fully-async scheduling, resource split and decoupled-logprob flags are added, and
 # the transfer_queue block (sync-only) is removed.
 #
@@ -29,9 +30,9 @@ async_training:
   use_trainer_do_validate: False
 
 # ---- Rollout resource pool + streaming budget (disaggregated from the trainer pool).
-#      2 nodes x 8 = 16 rollout GPUs -> 2 vLLM replicas (TP=8 each). ----
+#      3 nodes x 8 = 24 rollout GPUs -> 3 vLLM replicas (TP=8 each). ----
 rollout:
-  nnodes: 2
+  nnodes: 3
   n_gpus_per_node: 8
   # Prompts streamed before the termination signal. required_samples = ppo_mini_batch_size *
   # require_batches = 16, so 32 -> ~2 training steps (smoke length).
@@ -192,12 +193,15 @@ actor_rollout_ref:
       default_agent_loop: search_agent
       num_workers: 32
 
-# ---- Trainer resource pool. 2 nodes x 8 = 16 training GPUs (TP=8 -> data parallel = 2). ----
+# ---- Trainer resource pool. 1 node x 8 = 8 training GPUs (TP=8 -> data parallel = 1).
+#      dp=1 on purpose: with dp>1, _balance_batch / dp-dispatch assert the (variable) multi-output
+#      row count is divisible by dp_size, which our padding does not yet guarantee that early.
+#      For dp>1 (e.g. trainer 2 nodes) that needs the early dp-aligned padding fix first. ----
 trainer:
   logger: ["console", "clearml"]
   project_name: searchagent_megatron_35b_fully_async
   experiment_name: searchagent-35b-4node-fully-async
-  nnodes: 2
+  nnodes: 1
   n_gpus_per_node: 8
   # Validation through the rollouter (use_trainer_do_validate=False); sampling val_kwargs above.
   val_before_train: True
