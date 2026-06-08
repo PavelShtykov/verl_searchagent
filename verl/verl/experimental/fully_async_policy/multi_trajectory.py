@@ -32,6 +32,53 @@ from verl.trainer.ppo.ray_trainer import compute_advantage
 
 SESSION_ID_KEY = "agent_session_id"
 OUTPUT_INDEX_KEY = "agent_output_index"
+IS_PADDING_KEY = "is_padding"
+
+
+def pad_dataproto_to_multiple(batch: DataProto, multiple: int) -> DataProto:
+    """Pad a batch with cheap masked no-op rows so its size is a multiple of ``multiple``.
+
+    Multi-output rollouts emit a variable row count that need not divide the actor mini-batch size
+    (``ppo_mini_batch_size * rollout.n``, itself a multiple of the data-parallel size). Padding to
+    that multiple early — before seqlen balancing and the dp-sharded forward/backward passes — keeps
+    every downstream step well-defined for data parallel > 1.
+
+    Padding rows clone the first row (keeping every tensor shape/dtype valid) but keep a single
+    attention token and zero the loss-bearing fields, so they add no gradient, no reward and
+    negligible compute. Every row gets an ``is_padding`` flag so metrics / dumps can drop the
+    synthetic rows; padding rows use a dedicated ``uid`` so they form their own (ignored) GRPO group
+    and never perturb a real prompt's group. ``pad_size`` is always smaller than ``multiple``.
+    """
+    size = len(batch)
+    batch.non_tensor_batch[IS_PADDING_KEY] = np.zeros(size, dtype=bool)
+    remainder = size % multiple
+    if remainder == 0:
+        return batch
+
+    pad_size = multiple - remainder
+    pad = batch.select_idxs([0] * pad_size)
+    if "attention_mask" in pad.batch.keys():
+        attention_mask = torch.zeros_like(pad.batch["attention_mask"])
+        attention_mask[:, 0] = 1  # keep one valid token so the packed forward stays well-formed
+        pad.batch["attention_mask"] = attention_mask
+    for key in ("response_mask", "loss_mask", "advantages", "returns", "token_level_scores", "token_level_rewards"):
+        if key in pad.batch.keys():
+            pad.batch[key] = torch.zeros_like(pad.batch[key])
+    if "uid" in pad.non_tensor_batch:
+        pad.non_tensor_batch["uid"] = np.array(["__pad__"] * pad_size, dtype=object)
+    if SESSION_ID_KEY in pad.non_tensor_batch:
+        pad.non_tensor_batch[SESSION_ID_KEY] = np.arange(pad_size, dtype=np.int32)
+    if OUTPUT_INDEX_KEY in pad.non_tensor_batch:
+        pad.non_tensor_batch[OUTPUT_INDEX_KEY] = np.zeros(pad_size, dtype=np.int32)
+    pad.non_tensor_batch[IS_PADDING_KEY] = np.ones(pad_size, dtype=bool)
+
+    # ``select_idxs`` carries ``batch.meta_info``; clear it so ``DataProto.concat`` does not assert
+    # equality on array-valued meta_info entries (e.g. ``global_token_num``).
+    pad.meta_info = {}
+    padded = DataProto.concat([batch, pad])
+    if "global_token_num" in padded.meta_info and "attention_mask" in padded.batch.keys():
+        padded.meta_info["global_token_num"] = padded.batch["attention_mask"].sum(dim=-1).tolist()
+    return padded
 
 
 def has_multi_trajectory_outputs(batch: DataProto) -> bool:

@@ -33,10 +33,10 @@ from verl.experimental.fully_async_policy.detach_utils import (
 )
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
 from verl.experimental.fully_async_policy.multi_trajectory import (
-    OUTPUT_INDEX_KEY,
-    SESSION_ID_KEY,
+    IS_PADDING_KEY,
     compute_multi_trajectory_advantage,
     has_multi_trajectory_outputs,
+    pad_dataproto_to_multiple,
 )
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
@@ -330,11 +330,15 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         )
 
         queue_samples = [ray.cloudpickle.loads(x) for x in queue_samples]
-        # Assemble batch - now working directly with RolloutSample objects
+        # Assemble the batch WITHOUT the internal seqlen balance: multi-output rollouts give a
+        # variable row count, so we first pad to a dp-aligned multiple (ppo_mini_batch_size * n,
+        # itself a multiple of dp_size) and only then balance, so balancing and the dp-sharded
+        # forward/backward passes stay well-defined for data parallel > 1.
+        batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, None)
+        multiple = self.config.actor_rollout_ref.actor.ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        batch = pad_dataproto_to_multiple(batch, multiple)
         if self.config.trainer.balance_batch:
-            batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, self._balance_batch)
-        else:
-            batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, None)
+            self._balance_batch(batch, metrics={})
 
         batch.meta_info["fully_async/total_wait_time"] = total_wait_time
         return 0, batch
@@ -391,54 +395,25 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         return batch
 
-    def _fit_update_actor(self, batch: DataProto) -> DataProto:
-        # Pad only for the actor update (its mini-batch iterator requires a divisible row count);
-        # downstream dump/metrics keep operating on the real, unpadded batch.
-        super()._fit_update_actor(self._pad_to_actor_mini_batch_size(batch))
-        return batch
-
-    def _pad_to_actor_mini_batch_size(self, batch: DataProto) -> DataProto:
-        """Append cheap masked no-op rows so the batch size divides the actor mini-batch size.
-
-        Multi-output rollouts emit a variable row count that need not divide
-        ``ppo_mini_batch_size * rollout.n``. Padding rows clone the first row (keeping every tensor
-        shape/dtype valid) but reduce attention to a single token and zero the loss-bearing fields
-        (response/loss mask, advantages, returns, scores), so they add no gradient, no reward and
-        negligible compute. ``pad_size`` is always smaller than one mini-batch, so no mini-batch is
-        entirely padding.
-        """
-        mini_batch_size = (
-            self.config.actor_rollout_ref.actor.ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
-        )
-        size = len(batch)
-        remainder = size % mini_batch_size
-        if remainder == 0:
+    def _drop_padding_rows(self, batch: DataProto) -> DataProto:
+        """Return a view of ``batch`` without the synthetic padding rows, for metrics and dumps."""
+        if IS_PADDING_KEY not in batch.non_tensor_batch:
             return batch
+        keep = ~batch.non_tensor_batch[IS_PADDING_KEY].astype(bool)
+        if keep.all():
+            return batch
+        real = batch.select_idxs(np.nonzero(keep)[0].tolist())
+        real.meta_info = dict(real.meta_info)
+        if "attention_mask" in real.batch.keys():
+            real.meta_info["global_token_num"] = real.batch["attention_mask"].sum(dim=-1).tolist()
+        return real
 
-        pad_size = mini_batch_size - remainder
-        pad = batch.select_idxs([0] * pad_size)
-        if "attention_mask" in pad.batch.keys():
-            attention_mask = torch.zeros_like(pad.batch["attention_mask"])
-            attention_mask[:, 0] = 1  # keep one valid token so the packed forward stays well-formed
-            pad.batch["attention_mask"] = attention_mask
-        for key in ("response_mask", "loss_mask", "advantages", "returns", "token_level_scores", "token_level_rewards"):
-            if key in pad.batch.keys():
-                pad.batch[key] = torch.zeros_like(pad.batch[key])
-        if "uid" in pad.non_tensor_batch:
-            pad.non_tensor_batch["uid"] = np.array(["__pad__"] * pad_size, dtype=object)
-        if SESSION_ID_KEY in pad.non_tensor_batch:
-            pad.non_tensor_batch[SESSION_ID_KEY] = np.arange(pad_size, dtype=np.int32)
-        if OUTPUT_INDEX_KEY in pad.non_tensor_batch:
-            pad.non_tensor_batch[OUTPUT_INDEX_KEY] = np.zeros(pad_size, dtype=np.int32)
+    def _fit_collect_metrics(self, batch):
+        # Exclude padding rows so reward / length / throughput metrics reflect real trajectories only.
+        super()._fit_collect_metrics(self._drop_padding_rows(batch))
 
-        logger.info("Padded actor batch %d -> %d rows (mini_batch_size=%d)", size, size + pad_size, mini_batch_size)
-        # ``select_idxs`` carries ``batch.meta_info``; clear it so ``DataProto.concat`` does not
-        # assert equality on array-valued meta_info entries (e.g. ``global_token_num``).
-        pad.meta_info = {}
-        padded = DataProto.concat([batch, pad])
-        if "global_token_num" in padded.meta_info and "attention_mask" in padded.batch.keys():
-            padded.meta_info["global_token_num"] = padded.batch["attention_mask"].sum(dim=-1).tolist()
-        return padded
+    def _fit_dump_data(self, batch):
+        super()._fit_dump_data(self._drop_padding_rows(batch))
 
     def _create_actor_rollout_classes(self):
         # create actor — always use Role.Actor (not ActorRollout) even when
